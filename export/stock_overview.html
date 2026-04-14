@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>雪球数据库 - 股票数据总览 — SH601020</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f1117; color: #e0e0e0; padding: 24px; }
+  h1 { font-size: 20px; margin-bottom: 8px; color: #fff; }
+  .summary { color: #888; font-size: 14px; margin-bottom: 16px; }
+  .summary span { color: #4fc3f7; font-weight: 600; }
+  .toolbar { margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .toolbar input { background: #1a1d28; border: 1px solid #2a2d38; color: #e0e0e0; padding: 6px 12px; border-radius: 4px; font-size: 13px; width: 240px; outline: none; }
+  .toolbar input:focus { border-color: #4fc3f7; }
+  .toolbar button { background: #1a2d3d; border: 1px solid #2a4d5d; color: #4fc3f7; padding: 6px 14px; border-radius: 4px; font-size: 13px; cursor: pointer; }
+  .toolbar button:hover { background: #2a3d4d; }
+  .toolbar button.active { background: #2d4d5d; border-color: #4fc3f7; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead { position: sticky; top: 0; z-index: 10; }
+  th { background: #1a1d28; color: #aaa; font-weight: 500; text-align: left; padding: 10px 12px; border-bottom: 1px solid #2a2d38; white-space: nowrap; }
+  td { padding: 8px 12px; border-bottom: 1px solid #1a1d28; white-space: nowrap; }
+  tr:hover { background: #1a1d28; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .market-tag { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; }
+  .m-a { background: #2d1f1f; color: #f87171; }
+  .m-hk { background: #1f2d1f; color: #4ade80; }
+  .m-us { background: #1f1f2d; color: #818cf8; }
+  .m-bj { background: #2d2d1f; color: #facc15; }
+  .m-other { background: #1f2d2d; color: #22d3ee; }
+  .zero { color: #555; }
+  .highlight { color: #4fc3f7; font-weight: 500; }
+  tfoot td { background: #1a1d28; font-weight: 600; color: #fff; border-top: 1px solid #4fc3f7; }
+  .hidden { display: none; }
+  .stats { display: flex; gap: 24px; margin-bottom: 16px; }
+  .stat-card { background: #1a1d28; border: 1px solid #2a2d38; border-radius: 8px; padding: 16px 24px; flex: 1; }
+  .stat-card .label { color: #888; font-size: 12px; margin-bottom: 4px; }
+  .stat-card .value { color: #fff; font-size: 24px; font-weight: 600; }
+  .stat-card .value.blue { color: #4fc3f7; }
+  .stat-card .value.green { color: #4ade80; }
+  .stat-card .value.purple { color: #a78bfa; }
+</style>
+</head>
+<body>
+<h1>雪球舆情数据库 — 股票数据总览 — SH601020</h1>
+<div class="stats">
+  <div class="stat-card"><div class="label">股票数量</div><div class="value">1</div></div>
+  <div class="stat-card"><div class="label">帖子总数</div><div class="value blue">991</div></div>
+  <div class="stat-card"><div class="label">评论总数</div><div class="value green">2,749</div></div>
+  <div class="stat-card"><div class="label">有评论的股票</div><div class="value purple">1</div></div>
+</div>
+<div class="toolbar">
+  <input type="text" id="search" placeholder="搜索股票代码/名称..." oninput="filterTable()">
+  <button onclick="filterComments()" id="btn-comments">仅显示有评论</button>
+  <button onclick="filterNoComments()" id="btn-nocomments">仅无评论</button>
+  <button onclick="resetFilter()">重置</button>
+</div>
+<table id="data">
+<thead><tr>
+  <th>#</th><th>股票代码</th><th>股票名</th><th>市场</th><th class="num">帖子数</th><th class="num">评论数</th><th>帖子起始</th><th>帖子截止</th><th>评论起始</th><th>评论截止</th>
+</tr></thead>
+<tbody id="tbody">
+<tr><td>1</td><td>SH601020</td><td>华钰矿业</td><td><span class="market-tag m-a">A股-沪</span></td><td class="num">991</td><td class="num"><span class="highlight">2,749</span></td><td>2026-01-19</td><td>2026-03-17</td><td>2026-01-19</td><td>2026-03-17</td></tr>
+
+</tbody>
+<tfoot><tr>
+  <td></td><td>合计</td><td>1只</td><td></td>
+  <td class="num">991</td><td class="num">2,749</td><td colspan="4"></td>
+</tr></tfoot>
+</table>
+<script>
+function filterTable() {
+  var q = document.getElementById('search').value.toLowerCase();
+  document.getElementById('btn-comments').classList.remove('active');
+  document.getElementById('btn-nocomments').classList.remove('active');
+  var rows = document.querySelectorAll('#tbody tr');
+  rows.forEach(function(r) {
+    r.classList.toggle('hidden', r.textContent.toLowerCase().indexOf(q) === -1);
+  });
+}
+function filterComments() {
+  document.getElementById('btn-comments').classList.add('active');
+  document.getElementById('btn-nocomments').classList.remove('active');
+  document.getElementById('search').value = '';
+  var rows = document.querySelectorAll('#tbody tr');
+  rows.forEach(function(r) {
+    var cc = parseInt(r.querySelectorAll('td')[5].textContent.replace(/,/g,''));
+    r.classList.toggle('hidden', cc === 0);
+  });
+}
+function filterNoComments() {
+  document.getElementById('btn-nocomments').classList.add('active');
+  document.getElementById('btn-comments').classList.remove('active');
+  document.getElementById('search').value = '';
+  var rows = document.querySelectorAll('#tbody tr');
+  rows.forEach(function(r) {
+    var cc = parseInt(r.querySelectorAll('td')[5].textContent.replace(/,/g,''));
+    r.classList.toggle('hidden', cc !== 0);
+  });
+}
+function resetFilter() {
+  document.getElementById('search').value = '';
+  document.getElementById('btn-comments').classList.remove('active');
+  document.getElementById('btn-nocomments').classList.remove('active');
+  document.querySelectorAll('#tbody tr').forEach(function(r) { r.classList.remove('hidden'); });
+}
+</script>
+</body></html>

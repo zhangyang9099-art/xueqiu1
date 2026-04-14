@@ -1,0 +1,37 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 数据库
+data/xueqiu.db
+data/xueqiu.db-wal
+data/xueqiu.db-shm
+data/xueqiu.db.v2_backup*
+
+# Chrome profile
+data/manual_chrome_profile/
+
+# 日志
+data/logs/
+*.log
+
+# 运行时产物
+data/snapshots/
+data/run_reports/
+data/daily-reports/
+data/analysis-reports/
+data/overnight_runs/
+
+# 导出
+data/export/
+
+# 浏览器cookies
+data/browser_cookies.json
+
+# .DS_Store
+.DS_Store

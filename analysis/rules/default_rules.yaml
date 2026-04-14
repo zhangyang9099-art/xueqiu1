@@ -1,0 +1,54 @@
+# 推票规则配置
+# 所有情绪判断来自 LLM 标注结果，不使用关键词匹配
+
+rules:
+  cold_forum_opportunity:
+    name: "冷清股吧潜力票"
+    description: "股吧讨论持续低迷，但股价在近一年低位区间"
+    enabled: true
+    conditions:
+      comment_ratio_below: 0.30        # 最近7天日均评论 < 基准的30%
+      price_percentile_below: 30       # 当前价在近一年价格区间的30%以下
+    action: "关注"
+    action_detail: "加入观察列表，等待基本面或技术面催化剂"
+    historical_note: "历史样本中五粮液和华大基因出现过此模式"
+    confidence: "medium"
+
+  hot_forum_warning:
+    name: "过热股吧回调预警"
+    description: "讨论量暴增 + 情绪偏多 + 股价高位"
+    enabled: true
+    conditions:
+      comment_deviation_above: 2.0     # 评论量超过基准2个标准差
+      bullish_ratio_above: 0.70        # LLM标注看多比例>70%
+      price_percentile_above: 80       # 当前价在近30天价格区间的80%以上
+    action: "减仓/止盈"
+    action_detail: "如果持有此票，建议设止盈线或减至半仓"
+    historical_note: "舆情峰值附近出现价格拐点的概率约70%"
+    confidence: "high"
+
+  retail_trap:
+    name: "散户接盘陷阱"
+    description: "股价放量下跌，但散户仍在看多"
+    enabled: true
+    conditions:
+      price_change_below: -0.05        # 近5天跌幅超5%
+      price_change_days: 5
+      volume_ratio_above: 1.5          # 近5天均量 > 前30天均量的1.5倍
+      bullish_ratio_above: 0.60        # LLM标注看多比例>60%
+    action: "远离/止损"
+    action_detail: "如果持有立即设止损。如果没有不要抄底。"
+    historical_note: "所有背离模式中最危险的一种"
+    confidence: "high"
+
+  sentiment_extreme_reversal:
+    name: "情绪极端反转信号"
+    description: "LLM标注情绪从前3天看空为主，突然转为看多"
+    enabled: true
+    conditions:
+      bullish_ratio_above: 0.65        # 近1天看多比例
+      previous_bearish_ratio_above: 0.65 # 前3天看空比例
+    action: "关注反弹"
+    action_detail: "情绪极端反转可能预示短期反弹，但不构成买入依据"
+    historical_note: "情绪反转后3天内出现反弹的概率约55%"
+    confidence: "low"
