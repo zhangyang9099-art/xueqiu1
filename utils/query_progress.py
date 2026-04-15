@@ -753,17 +753,6 @@ def get_user_scrape_overview(user_ids: list[str] | None = None) -> dict:
               AND status IN ('success', 'partial')
               AND duration_seconds > 0
             GROUP BY target
-        ),
-        latest_failures AS (
-            SELECT l1.target AS user_id, l1.error_message AS latest_error_message
-            FROM scrape_logs l1
-            JOIN (
-                SELECT target, MAX(id) AS max_id
-                FROM scrape_logs
-                WHERE task_type = 'user_track'
-                  AND status IN ('failed', 'deferred', 'partial')
-                GROUP BY target
-            ) lf ON lf.target = l1.target AND lf.max_id = l1.id
         )
         SELECT
             b.*,
@@ -776,14 +765,12 @@ def get_user_scrape_overview(user_ids: list[str] | None = None) -> dict:
             COALESCE(pg.missing_comments, 0) AS missing_comments,
             COALESCE(pg.gap_posts, 0) AS gap_posts,
             COALESCE(ls.run_count, 0) AS run_count,
-            COALESCE(ls.avg_duration_sec, 0) AS avg_duration_sec,
-            COALESCE(lf.latest_error_message, '') AS latest_error_message
+            COALESCE(ls.avg_duration_sec, 0) AS avg_duration_sec
         FROM base_users b
         LEFT JOIN user_agg a ON a.user_id = b.user_id
         LEFT JOIN user_comment_counts cc ON cc.user_id = b.user_id
         LEFT JOIN user_post_gap pg ON pg.user_id = b.user_id
         LEFT JOIN user_log_stats ls ON ls.user_id = b.user_id
-        LEFT JOIN latest_failures lf ON lf.user_id = b.user_id
         ORDER BY b.user_id
         """,
         params,
@@ -1163,7 +1150,6 @@ def command_user_scrape_status(args: argparse.Namespace) -> int:
             f"({active_row['user_id']}) | 模式 {active_row.get('runtime_mode') or overview['state'].get('phase') or '-'} "
             f"| page={int(active_row.get('runtime_page') or 0)} "
             f"| chunk={int(active_row.get('runtime_chunk') or 0)} "
-            f"| cursor={int(active_row.get('history_cursor_page') or 0)} "
             f"| state={active_row.get('runtime_state') or '-'}"
         )
 
@@ -1199,17 +1185,12 @@ def command_user_scrape_status(args: argparse.Namespace) -> int:
         detail_parts = []
         if int(row.get("history_stagnant_runs") or 0) > 0:
             detail_parts.append(f"停滞{int(row['history_stagnant_runs'])}次")
-        if int(row.get("total_replies") or 0) > 0:
-            detail_parts.append(f"互动{int(row['total_replies'])}")
         if int(row.get("total_likes") or 0) > 0:
             detail_parts.append(f"赞{int(row['total_likes'])}")
         if row.get("note"):
             detail_parts.append(f"[{row['note']}]")
         if detail_parts:
             print(f"{'':>18} {' '.join(detail_parts)}")
-        latest_error = str(row.get("latest_error_message") or "").strip()
-        if latest_error:
-            print(f"{'':>18} 最近异常: {latest_error[:120]}")
 
     print("=" * 110)
     summary = overview["summary"]

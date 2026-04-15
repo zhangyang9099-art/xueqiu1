@@ -220,7 +220,7 @@ class HistorySessionReuseTests(unittest.TestCase):
         self.assertEqual("success", results[0]["status"])
         self.assertEqual(1, _FakeStateDb.init_count)
         self.assertEqual(1, _FakeStateDb.close_count)
-        self.assertGreaterEqual(_FakeStockCommentScraper.call_counts["SZ000733"], 1)
+        self.assertEqual(2, _FakeStockCommentScraper.call_counts["SZ000733"])
 
     def test_history_transient_failure_retries_current_stock_before_failing_batch(self):
         _FakeStockCommentScraper.calls = []

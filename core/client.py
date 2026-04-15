@@ -19,7 +19,6 @@ import sys
 import time
 from urllib.parse import urlencode
 
-from scrapers.api_endpoints import build_user_timeline_params, build_user_timeline_url
 from utils.logger import get_logger
 
 try:
@@ -142,11 +141,6 @@ class XueqiuClient:
         self._history_unexpected_html_retry = max(
             0, int(self.config.get("history_unexpected_html_retry", 1) or 1)
         )
-        self._waf_refresh_cooldown_seconds = float(
-            self.config.get("waf_refresh_cooldown_seconds", 60) or 60
-        )
-        self._last_waf_refresh = 0.0
-        self._user_timeline_count_limit_cache = {}
 
     # ──────── 浏览器生命周期 ────────
 
@@ -989,7 +983,6 @@ class XueqiuClient:
 
         persistent_kwargs = dict(launch_kwargs)
         persistent_kwargs.update(self._browser_context_options())
-        captured_storage = {"local": {}, "session": {}}
         ctx = self._playwright.chromium.launch_persistent_context(
             profile_dir,
             **persistent_kwargs,
@@ -1012,25 +1005,11 @@ class XueqiuClient:
                 raise CaptchaRequired("手动验证完成后仍停留在访问验证页")
             if self.cookie_manager:
                 self.cookie_manager.capture_from_context(ctx)
-            try:
-                captured_storage = page.evaluate(
-                    """() => ({
-                        local: Object.fromEntries(
-                            Object.keys(localStorage).map((k) => [k, localStorage.getItem(k)])
-                        ),
-                        session: Object.fromEntries(
-                            Object.keys(sessionStorage).map((k) => [k, sessionStorage.getItem(k)])
-                        ),
-                    })"""
-                ) or {"local": {}, "session": {}}
-            except Exception:
-                captured_storage = {"local": {}, "session": {}}
         finally:
             try:
                 ctx.close()
             except Exception:
                 pass
-        return captured_storage
 
     def _seed_manual_profile_from_cookie_jar(self, target_url: str, storage_state: dict | None = None):
         if self._profile_bootstrap_mode == "never":
@@ -1097,12 +1076,7 @@ class XueqiuClient:
             except Exception:
                 pass
 
-    def _restore_runtime_after_external_verification(
-        self,
-        target_url: str,
-        referer_path: str = "",
-        storage_state: dict | None = None,
-    ):
+    def _restore_runtime_after_external_verification(self, target_url: str, referer_path: str = ""):
         self._close_runtime(stop_playwright=False)
         self._launch_browser_instance(headless=self.config.get("browser_headless", True))
         self._restore_session_cookies()
@@ -1111,7 +1085,7 @@ class XueqiuClient:
         except Exception as e:
             logger.warning(f"外部验证后恢复主页失败: {e}")
         time.sleep(random.uniform(1.0, 2.0))
-        self._restore_runtime_storage(target_url, storage_state=storage_state)
+        self._restore_runtime_storage(target_url)
         session_state = self._current_session_state()
         if session_state == "captcha_required":
             self._clear_runtime_storage_sidecar()
@@ -1139,283 +1113,6 @@ class XueqiuClient:
         self._initialized = True
         self._closed = False
         self._clear_runtime_storage_sidecar()
-
-    def probe_user_timeline_access(
-        self,
-        user_id: str,
-        *,
-        referer_path: str | None = None,
-        count: int = 1,
-        page: int = 1,
-        timeout_ms: int = 15000,
-        log_success: bool = False,
-    ) -> dict:
-        referer_path = referer_path or f"/u/{user_id}"
-        url = build_user_timeline_url()
-        params = build_user_timeline_params(user_id, count=max(1, int(count or 1)), page=max(1, int(page or 1)))
-        try:
-            data = self.get(
-                url,
-                params=params,
-                referer_path=referer_path,
-                timeout_ms=timeout_ms,
-                max_retries=1,
-                transport="page",
-            )
-            statuses = data.get("statuses") or []
-            if log_success:
-                logger.info(
-                    "用户时间线探测通过: user_id=%s statuses=%s auth_cookies=%s",
-                    user_id,
-                    len(statuses),
-                    sorted(self._runtime_cookie_names()),
-                )
-            return {
-                "ok": True,
-                "user_id": str(user_id),
-                "count": int(count),
-                "page": int(page),
-                "status_count": len(statuses),
-                "max_page": int(data.get("maxPage", 0) or 0),
-                "has_auth_cookies": self._has_runtime_auth_cookies(),
-                "auth_cookie_names": sorted(self._runtime_cookie_names()),
-            }
-        except RequestFailed as e:
-            failure = self.get_last_failure_meta()
-            return {
-                "ok": False,
-                "user_id": str(user_id),
-                "count": int(count),
-                "page": int(page),
-                "category": e.category,
-                "detail": e.detail,
-                "message": str(e),
-                "failure_meta": failure,
-                "has_auth_cookies": self._has_runtime_auth_cookies(),
-                "auth_cookie_names": sorted(self._runtime_cookie_names()),
-            }
-        except Exception as e:
-            failure = self.get_last_failure_meta()
-            return {
-                "ok": False,
-                "user_id": str(user_id),
-                "count": int(count),
-                "page": int(page),
-                "category": "probe_failed",
-                "detail": str(e),
-                "message": f"{type(e).__name__}: {e}",
-                "failure_meta": failure,
-                "has_auth_cookies": self._has_runtime_auth_cookies(),
-                "auth_cookie_names": sorted(self._runtime_cookie_names()),
-            }
-
-    def get_user_timeline_count_limit(self, user_id: str) -> int:
-        return int(self._user_timeline_count_limit_cache.get(str(user_id), 0) or 0)
-
-    def set_user_timeline_count_limit(self, user_id: str, limit: int) -> None:
-        if int(limit or 0) > 0:
-            self._user_timeline_count_limit_cache[str(user_id)] = int(limit)
-
-    def _user_timeline_probe_counts(self, preferred_count: int, probe_candidates=None) -> list[int]:
-        configured = probe_candidates or self.config.get("user_timeline_probe_counts", [40, 30, 20])
-        values = []
-        for raw in [preferred_count, *(configured or [])]:
-            try:
-                val = int(raw or 0)
-            except Exception:
-                continue
-            if val > 0 and val not in values:
-                values.append(val)
-        return sorted(values, reverse=True)
-
-    def resolve_user_timeline_count_limit(
-        self,
-        user_id: str,
-        *,
-        referer_path: str | None = None,
-        preferred_count: int = 20,
-        probe_candidates=None,
-        page: int = 1,
-        timeout_ms: int = 15000,
-    ) -> dict:
-        referer_path = referer_path or f"/u/{user_id}"
-        last_probe = {}
-        for count in self._user_timeline_probe_counts(preferred_count, probe_candidates):
-            probe = self.probe_user_timeline_access(
-                user_id,
-                referer_path=referer_path,
-                count=count,
-                page=page,
-                timeout_ms=timeout_ms,
-                log_success=True,
-            )
-            last_probe = probe
-            if probe.get("ok"):
-                self.set_user_timeline_count_limit(user_id, count)
-                probe["resolved_count"] = int(count)
-                return probe
-            category = str(probe.get("category") or "")
-            if category not in {"http_400_10022", "timeline_count_limit"}:
-                return probe
-        if last_probe:
-            last_probe["resolved_count"] = 0
-        return last_probe
-
-    def _wait_for_user_timeline_login(
-        self,
-        user_id: str,
-        *,
-        screen_name: str = "",
-        probe_count: int = 1,
-        probe_candidates=None,
-        timeout_seconds: int | None = None,
-    ) -> dict:
-        timeout_seconds = int(timeout_seconds or self._manual_verification_timeout_seconds or 300)
-        target_url = f"https://xueqiu.com/u/{user_id}"
-        referer_path = f"/u/{user_id}"
-        if self.config.get("browser_headless", True):
-            self._close_runtime(stop_playwright=False)
-            self._launch_browser_instance(headless=False)
-            self._restore_session_cookies()
-        page = self._ensure_live_page()
-        if not page:
-            raise RequestFailed("user_timeline_probe_failed", "无法打开用于登录的浏览器窗口", url=target_url)
-        try:
-            page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-        except Exception as e:
-            logger.warning(f"打开用户登录页失败 ({target_url}): {e}")
-        try:
-            page.bring_to_front()
-        except Exception:
-            pass
-
-        display_name = f"{screen_name}({user_id})" if screen_name else f"用户 {user_id}"
-        logger.warning(
-            "用户时间线接口尚未就绪，请在当前爬虫浏览器窗口完成雪球登录/重新登录。"
-            "程序会持续探测 user_timeline.json，探测通过后自动继续。目标: %s",
-            display_name,
-        )
-        deadline = time.time() + timeout_seconds
-        last_refresh_at = 0.0
-        while time.time() < deadline:
-            if not self._ensure_live_page():
-                raise RequestFailed(
-                    "user_timeline_probe_failed",
-                    "登录窗口已关闭，无法继续验证用户时间线接口",
-                    url=target_url,
-                )
-            now = time.time()
-            if now - last_refresh_at >= 20:
-                try:
-                    self._page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-                except Exception:
-                    pass
-                last_refresh_at = now
-            time.sleep(max(1.0, min(self._manual_verification_poll_seconds, 3.0)))
-            probe = self.probe_user_timeline_access(
-                user_id,
-                referer_path=referer_path,
-                count=probe_count,
-                page=1,
-                timeout_ms=12000,
-            )
-            if probe.get("ok"):
-                self._persist_session()
-                self._warmed_paths.clear()
-                try:
-                    self._warm_referer_path(referer_path)
-                except Exception:
-                    pass
-                logger.info("用户时间线接口验证通过，继续执行: user_id=%s", user_id)
-                return probe
-            resolved = self.resolve_user_timeline_count_limit(
-                user_id,
-                referer_path=referer_path,
-                preferred_count=probe_count,
-                probe_candidates=probe_candidates,
-                page=1,
-                timeout_ms=12000,
-            )
-            if resolved.get("ok"):
-                self._persist_session()
-                self._warmed_paths.clear()
-                try:
-                    self._warm_referer_path(referer_path)
-                except Exception:
-                    pass
-                logger.info(
-                    "用户时间线接口验证通过，继续执行: user_id=%s resolved_count=%s",
-                    user_id,
-                    resolved.get("resolved_count"),
-                )
-                return resolved
-        raise RequestFailed(
-            "user_timeline_probe_failed",
-            f"等待用户时间线接口就绪超时: {user_id}",
-            url=target_url,
-            detail="等待手动登录后接口验证通过超时",
-        )
-
-    def ensure_user_timeline_ready(
-        self,
-        user_id: str,
-        *,
-        screen_name: str = "",
-        probe_count: int = 1,
-        probe_candidates=None,
-        max_manual_attempts: int = 1,
-    ) -> dict:
-        referer_path = f"/u/{user_id}"
-        target_url = f"https://xueqiu.com{referer_path}"
-        self._ensure_browser()
-        try:
-            self._warm_referer_path(referer_path)
-        except Exception as e:
-            logger.warning(f"用户时间线探测前预热失败 ({target_url}): {e}")
-
-        last_probe = self.resolve_user_timeline_count_limit(
-            user_id,
-            referer_path=referer_path,
-            preferred_count=probe_count,
-            probe_candidates=probe_candidates,
-            page=1,
-        )
-        if last_probe.get("ok"):
-            return last_probe
-
-        for attempt in range(1, max_manual_attempts + 1):
-            category = str(last_probe.get("category") or "")
-            detail = str(last_probe.get("detail") or last_probe.get("message") or "")
-            logger.warning(
-                "用户时间线接口未就绪: user_id=%s category=%s detail=%s auth_cookies=%s",
-                user_id,
-                category or "-",
-                detail or "-",
-                last_probe.get("auth_cookie_names") or [],
-            )
-            if not self._manual_verification_enabled:
-                break
-            logger.warning(
-                "开始第 %s/%s 次手动登录验证，目标接口: %s",
-                attempt,
-                max_manual_attempts,
-                target_url,
-            )
-            last_probe = self._wait_for_user_timeline_login(
-                user_id,
-                screen_name=screen_name,
-                probe_count=probe_count,
-                probe_candidates=probe_candidates,
-            )
-            if last_probe.get("ok"):
-                return last_probe
-
-        raise RequestFailed(
-            str(last_probe.get("category") or "user_timeline_probe_failed"),
-            f"用户时间线接口未就绪: {last_probe.get('message') or last_probe.get('detail') or target_url}",
-            url=target_url,
-            detail=str(last_probe.get("detail") or last_probe.get("message") or ""),
-        )
 
     def _handle_access_verification_external(self, target_url: str):
         referer_path = ""
@@ -1495,12 +1192,7 @@ class XueqiuClient:
             self._clear_runtime_storage_sidecar()
             raise CaptchaRequired("访问验证未在限定时间内完成，请关闭手动验证窗口后重试")
 
-        captured_storage = self._capture_cookies_from_manual_profile(target_url, referer_path=referer_path)
-        self._restore_runtime_after_external_verification(
-            target_url,
-            referer_path=referer_path,
-            storage_state=captured_storage,
-        )
+        self._restore_runtime_after_external_verification(target_url, referer_path=referer_path)
         self._mark_verification_recovered(
             target_url=target_url,
             referer_path=referer_path,
@@ -1585,8 +1277,6 @@ class XueqiuClient:
             return {"category": "http_forbidden", "detail": "HTTP 403"}
 
         if normalized_error:
-            if "err_internet_disconnected" in lower_error or "internet_disconnected" in lower_error:
-                return {"category": "transport_failure", "detail": normalized_error}
             if (
                 "wait_for_function" in lower_error
                 and "timeout" in lower_error
@@ -1956,42 +1646,6 @@ class XueqiuClient:
                         msg = data.get("error_description", "未知错误")
                         self._last_fetch_error = f"{ec}: {msg}"
                         if ec_str == "10022":
-                            requested_count = 0
-                            if isinstance(params, dict):
-                                try:
-                                    requested_count = int(params.get("count") or 0)
-                                except Exception:
-                                    requested_count = 0
-                            requested_user_id = ""
-                            if isinstance(params, dict):
-                                requested_user_id = str(params.get("user_id") or "")
-                            known_limit = (
-                                self.get_user_timeline_count_limit(requested_user_id)
-                                if requested_user_id
-                                else 0
-                            )
-                            if (
-                                requested_user_id
-                                and requested_count > 0
-                                and known_limit > 0
-                                and requested_count > known_limit
-                                and self._has_runtime_auth_cookies()
-                            ):
-                                self._set_last_failure_meta(
-                                    "timeline_count_limit",
-                                    url=url,
-                                    detail=f"{msg} | requested_count={requested_count} > known_limit={known_limit}",
-                                    status=status,
-                                    transport=transport,
-                                    has_auth_cookies=self._has_runtime_auth_cookies(),
-                                    auth_cookie_names=sorted(self._runtime_cookie_names()),
-                                )
-                                raise RequestFailed(
-                                    "timeline_count_limit",
-                                    f"用户时间线 count 超限: requested_count={requested_count}, known_limit={known_limit}",
-                                    url=url,
-                                    detail=msg,
-                                )
                             self._set_last_failure_meta(
                                 "http_400_10022",
                                 url=url,
@@ -2066,11 +1720,7 @@ class XueqiuClient:
                 )
                 if attempt >= max_retries:
                     raise
-                if "ERR_INTERNET_DISCONNECTED" in str(e) or "internet_disconnected" in str(e).lower():
-                    logger.warning("检测到网络断连，短暂停顿后重试")
-                    time.sleep(random.uniform(6, 10))
-                else:
-                    time.sleep(random.uniform(5, 15))
+                time.sleep(random.uniform(5, 15))
 
     def get_raw(self, url: str, params: dict = None) -> dict:
         return self.get(url, params)
@@ -2078,11 +1728,6 @@ class XueqiuClient:
     # ──────── 会话刷新 ────────
 
     def _refresh_waf(self):
-        now = time.time()
-        if now - self._last_waf_refresh < self._waf_refresh_cooldown_seconds:
-            logger.info("WAF 刷新冷却中，跳过重复刷新")
-            return
-        self._last_waf_refresh = now
         logger.info("重新通过 WAF 挑战...")
         try:
             try:
