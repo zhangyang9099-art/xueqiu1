@@ -165,6 +165,11 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_comment_memberships_comment ON comment_memberships(comment_id);
             CREATE INDEX IF NOT EXISTS idx_user_statuses_user ON user_statuses(user_id);
             CREATE INDEX IF NOT EXISTS idx_user_statuses_created ON user_statuses(created_at);
+            CREATE INDEX IF NOT EXISTS idx_posts_symbol_created ON posts(symbol, created_at);
+            CREATE INDEX IF NOT EXISTS idx_posts_user_created ON posts(user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_posts_user_gap_created ON posts(user_id, reply_count, comments_scraped, created_at);
+            CREATE INDEX IF NOT EXISTS idx_comments_canonical_created ON comments(canonical_post_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_user_statuses_user_created_id ON user_statuses(user_id, created_at, id);
             CREATE INDEX IF NOT EXISTS idx_trending_date ON trending_topics(captured_date, rank);
             CREATE INDEX IF NOT EXISTS idx_user_profiles_name ON user_profiles(screen_name);
         """)

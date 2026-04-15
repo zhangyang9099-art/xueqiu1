@@ -5,7 +5,6 @@ PROJECT_BIBLE_xueqiu_scraper.py
 README.md
 REVIEW_GUIDE.md
 SKILL.md
-Trader Workstation
 WAF_FIX_GUIDE.md
 analysis/__init__.py
 analysis/alert_engine.py
@@ -47,6 +46,7 @@ apply_production_fix.py
 batch_download_kline.py
 client.py
 config.yaml
+core/.DS_Store
 core/__init__.py
 core/auto_login.py
 core/browser_pool.py
@@ -77,6 +77,7 @@ phase5_fix.py
 phase5_scrape_cmd.py
 phase5_setup.py
 requirements.txt
+scrapers/.DS_Store
 scrapers/__init__.py
 scrapers/api_endpoints.py
 scrapers/scrape_cmd.py
@@ -84,10 +85,29 @@ scrapers/stock_comments.py
 scrapers/trending_scraper.py
 scrapers/user_tracker.py
 skill_api.py
+storage/.DS_Store
 storage/__init__.py
 storage/database.py
 test_playwright.py
+tests/.DS_Store
 tests/__init__.py
 tests/test_comment_backfill_runtime.py
 tests/test_comment_backfill_scope.py
 tests/test_comment_extraction.py
+tests/test_comment_parent_reconcile.py
+tests/test_history_session_reuse.py
+tests/test_history_timeline_recovery.py
+tests/test_manual_verification.py
+tests/test_manual_verification_external.py
+tests/test_user_tracking_runtime.py
+utils/.DS_Store
+utils/__init__.py
+utils/html_cleaner.py
+utils/logger.py
+utils/notifier.py
+utils/query_progress.py
+utils/run_reporter.py
+utils/stock_resolver.py
+utils/time_utils.py
+utils/user_resolver.py
+utils/watchlist_queue_runner.py

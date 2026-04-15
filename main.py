@@ -60,7 +60,12 @@ def load_config(config_path: str = "config.yaml") -> dict:
         print(f"[错误] 配置文件不存在: {path}")
         sys.exit(1)
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
+    cookie_cfg = config.setdefault("cookie", {})
+    env_token = os.environ.get("XUEQIU_TOKEN", "").strip()
+    if env_token:
+        cookie_cfg["xq_a_token"] = env_token
+    return config
 
 
 def init_components(config: dict):
@@ -129,42 +134,31 @@ def _build_user_sync_runtime_config(config: dict) -> dict:
     runtime = deepcopy(config)
     scraping_cfg = runtime.setdefault("scraping", {})
 
-    history_min = float(scraping_cfg.get("history_min_request_interval_seconds", 6) or 6)
-    history_max = float(scraping_cfg.get("history_max_request_interval_seconds", 12) or 12)
-    history_burst_count = int(scraping_cfg.get("history_burst_rest_count", 30) or 30)
-    history_burst_min = int(scraping_cfg.get("history_burst_rest_seconds_min", 120) or 120)
-    history_burst_max = int(scraping_cfg.get("history_burst_rest_seconds_max", 240) or 240)
+    history_min = float(scraping_cfg.get("history_min_request_interval_seconds", 3) or 3)
+    history_max = float(scraping_cfg.get("history_max_request_interval_seconds", 6) or 6)
+    history_burst_count = int(scraping_cfg.get("history_burst_rest_count", 80) or 80)
+    history_burst_min = int(scraping_cfg.get("history_burst_rest_seconds_min", 60) or 60)
+    history_burst_max = int(scraping_cfg.get("history_burst_rest_seconds_max", 90) or 90)
 
     scraping_cfg["use_persistent_context"] = True
     # 用户时间线接口对真实登录态和真实浏览器环境更敏感；
     # 这里强制改为非 headless，并尽量复用系统 Chrome。
     scraping_cfg["browser_headless"] = False
     scraping_cfg["browser_channel"] = scraping_cfg.get("browser_channel", "chrome") or "chrome"
-    # 用户/KOL 模式节奏与评论回填稳态对齐，避免继续使用全局 2-5s 的激进档位。
     scraping_cfg["min_request_interval"] = float(
-        scraping_cfg.get("user_sync_min_request_interval_seconds",
-                         scraping_cfg.get("comment_backfill_min_request_interval_seconds", history_min))
-        or scraping_cfg.get("comment_backfill_min_request_interval_seconds", history_min)
+        scraping_cfg.get("user_sync_min_request_interval_seconds", history_min) or history_min
     )
     scraping_cfg["max_request_interval"] = float(
-        scraping_cfg.get("user_sync_max_request_interval_seconds",
-                         scraping_cfg.get("comment_backfill_max_request_interval_seconds", history_max))
-        or scraping_cfg.get("comment_backfill_max_request_interval_seconds", history_max)
+        scraping_cfg.get("user_sync_max_request_interval_seconds", history_max) or history_max
     )
     scraping_cfg["burst_rest_count"] = int(
-        scraping_cfg.get("user_sync_burst_rest_count",
-                         scraping_cfg.get("comment_backfill_burst_rest_count", history_burst_count))
-        or scraping_cfg.get("comment_backfill_burst_rest_count", history_burst_count)
+        scraping_cfg.get("user_sync_burst_rest_count", history_burst_count) or history_burst_count
     )
     scraping_cfg["burst_rest_seconds_min"] = int(
-        scraping_cfg.get("user_sync_burst_rest_seconds_min",
-                         scraping_cfg.get("comment_backfill_burst_rest_seconds_min", history_burst_min))
-        or scraping_cfg.get("comment_backfill_burst_rest_seconds_min", history_burst_min)
+        scraping_cfg.get("user_sync_burst_rest_seconds_min", history_burst_min) or history_burst_min
     )
     scraping_cfg["burst_rest_seconds_max"] = int(
-        scraping_cfg.get("user_sync_burst_rest_seconds_max",
-                         scraping_cfg.get("comment_backfill_burst_rest_seconds_max", history_burst_max))
-        or scraping_cfg.get("comment_backfill_burst_rest_seconds_max", history_burst_max)
+        scraping_cfg.get("user_sync_burst_rest_seconds_max", history_burst_max) or history_burst_max
     )
     scraping_cfg["comment_mode_enabled"] = bool(
         scraping_cfg.get("comment_backfill_comment_mode_enabled", False)
@@ -180,6 +174,25 @@ def _build_user_sync_runtime_config(config: dict) -> dict:
             "comment_backfill_comment_mode_max_interval_seconds",
             scraping_cfg["max_request_interval"],
         ) or scraping_cfg["max_request_interval"]
+    )
+    scraping_cfg["adaptive_pacing_enabled"] = bool(scraping_cfg.get("history_adaptive_pacing", True))
+    scraping_cfg["adaptive_fast_min_interval"] = float(
+        scraping_cfg.get("history_adaptive_fast_min_request_interval_seconds", 3) or 3
+    )
+    scraping_cfg["adaptive_fast_max_interval"] = float(
+        scraping_cfg.get("history_adaptive_fast_max_request_interval_seconds", 5) or 5
+    )
+    scraping_cfg["adaptive_slow_min_interval"] = float(
+        scraping_cfg.get("history_adaptive_slow_min_request_interval_seconds", 6) or 6
+    )
+    scraping_cfg["adaptive_slow_max_interval"] = float(
+        scraping_cfg.get("history_adaptive_slow_max_request_interval_seconds", 10) or 10
+    )
+    scraping_cfg["adaptive_success_threshold"] = int(
+        scraping_cfg.get("history_adaptive_success_threshold", 30) or 30
+    )
+    scraping_cfg["adaptive_slow_request_count"] = int(
+        scraping_cfg.get("history_adaptive_slow_request_count", 15) or 15
     )
     return runtime
 
@@ -1028,16 +1041,20 @@ def cmd_sync_users(args, config):
             if history_users:
                 print(f"\n  · 跳过 {len(history_users)} 个未触底用户；如需先补全历史，请加 --ensure-history")
 
-        stale_update_users = []
-        tracked_map = _refresh_tracked()
-        for uid in update_users:
-            last_sync_time = int(tracked_map.get(uid, {}).get("last_sync_time", 0) or 0)
-            if ensure_history or not last_sync_time:
-                stale_update_users.append(uid)
-                continue
-            last_dt = datetime.fromtimestamp(last_sync_time / 1000)
-            if last_dt.date() != datetime.now().date():
-                stale_update_users.append(uid)
+        if ensure_history and history_users:
+            print("\n  · 由于仍有用户未触底，本次不进入增量同步阶段")
+            stale_update_users = []
+        else:
+            stale_update_users = []
+            tracked_map = _refresh_tracked()
+            for uid in update_users:
+                last_sync_time = int(tracked_map.get(uid, {}).get("last_sync_time", 0) or 0)
+                if ensure_history or not last_sync_time:
+                    stale_update_users.append(uid)
+                    continue
+                last_dt = datetime.fromtimestamp(last_sync_time / 1000)
+                if last_dt.date() != datetime.now().date():
+                    stale_update_users.append(uid)
 
         if stale_update_users:
             print(f"\n{'=' * 55}")

@@ -8,7 +8,7 @@
 #   2. F12 → Application → Cookies → xueqiu.com
 #   3. 复制 xq_a_token 的 Value 粘贴到下方
 cookie:
-  xq_a_token: "cb0038461faa714a89b1243eb0972aeb978da553"
+  xq_a_token: ""
   cookie_file: "data/browser_cookies.json"
 
 # --- 监控股票列表 ---
@@ -37,26 +37,26 @@ scraping:
   # 请求频率控制
   min_request_interval: 2    # 请求最小间隔（秒）
   max_request_interval: 5    # 请求最大间隔（秒）
-  max_requests_per_minute: 20  # 每分钟最大请求数
+  max_requests_per_minute: 30  # 每分钟最大请求数
   burst_rest_count: 95         # 每 N 次请求后强制休息
   burst_rest_seconds_min: 90  # 强制休息最少秒数
   burst_rest_seconds_max: 120  # 强制休息最多秒数
-  history_min_request_interval_seconds: 7
-  history_max_request_interval_seconds: 11
-  history_burst_rest_count: 50
-  history_burst_rest_seconds_min: 150
-  history_burst_rest_seconds_max: 240
-  history_adaptive_pacing: false
-  history_adaptive_fast_min_request_interval_seconds: 6
-  history_adaptive_fast_max_request_interval_seconds: 9
-  history_adaptive_slow_min_request_interval_seconds: 8
-  history_adaptive_slow_max_request_interval_seconds: 14
-  history_adaptive_success_threshold: 20
-  history_adaptive_slow_request_count: 20
+  history_min_request_interval_seconds: 3
+  history_max_request_interval_seconds: 6
+  history_burst_rest_count: 80
+  history_burst_rest_seconds_min: 60
+  history_burst_rest_seconds_max: 90
+  history_adaptive_pacing: true
+  history_adaptive_fast_min_request_interval_seconds: 3
+  history_adaptive_fast_max_request_interval_seconds: 5
+  history_adaptive_slow_min_request_interval_seconds: 6
+  history_adaptive_slow_max_request_interval_seconds: 10
+  history_adaptive_success_threshold: 30
+  history_adaptive_slow_request_count: 15
 
   # 每只股票最多爬取的帖子页数（防止首次运行过量）
   max_pages_per_stock: 50
-  stock_timeline_page_size: 10  # 与官网讨论区分页保持一致
+  stock_timeline_page_size: 40
   stock_timeline_source: "user" # 与官网“讨论”tab保持一致
   stock_timeline_sort: "time"
   timeline_request_timeout_ms: 12000  # 历史边界定位/时间线单页请求超时
@@ -74,17 +74,19 @@ scraping:
   comment_request_retries: 1         # 评论接口单页最多重试次数
   comment_post_budget_seconds: 25    # 单个帖子评论抓取预算
   comment_v3_enabled: true           # 优先使用网页展开评论的 v3 接口
-  comment_v3_page_size: 20           # v3 主评论页大小，保持与网页一致
+  comment_v3_page_size: 40
   comment_v3_child_max_pages: 30     # 单个“查看N条回复”链最多翻多少批
-  comment_backfill_min_request_interval_seconds: 8
-  comment_backfill_max_request_interval_seconds: 14
-  comment_backfill_burst_rest_count: 50
-  comment_backfill_burst_rest_seconds_min: 150
-  comment_backfill_burst_rest_seconds_max: 240
+  comment_backfill_min_request_interval_seconds: 3
+  comment_backfill_max_request_interval_seconds: 6
+  comment_backfill_burst_rest_count: 80
+  comment_backfill_burst_rest_seconds_min: 60
+  comment_backfill_burst_rest_seconds_max: 90
   comment_backfill_comment_mode_enabled: false
   comment_backfill_post_budget_seconds: 75
   # 每个用户最多爬取的发言页数
   max_pages_per_user: 50
+  user_timeline_page_size: 40
+  user_timeline_probe_counts: [40, 30, 20]
   history_confirm_runs: 2       # 历史补全连续多少次无进展后才判定触底
   history_chunk_pages: 3        # 历史模式按多少页为一个续跑分段
   # 用户时间线 transport 配置（参照评论回填模式，用于绕过反爬验证）
@@ -96,16 +98,17 @@ scraping:
   user_comment_post_budget_seconds: 30    # 单个帖子评论抓取预算（秒）
   user_comment_max_pages: 20              # 单帖评论最大页数
   user_incremental_comment_gap_limit: 60  # 用户每日增量后，最多补扫多少个旧发言评论缺口
-  user_sync_min_request_interval_seconds: 8
-  user_sync_max_request_interval_seconds: 14
-  user_sync_burst_rest_count: 50
-  user_sync_burst_rest_seconds_min: 150
-  user_sync_burst_rest_seconds_max: 240
+  user_comment_backfill_threshold: 2      # 用户旧帖评论增量回填阈值，极小缺口后置
+  user_sync_min_request_interval_seconds: 3
+  user_sync_max_request_interval_seconds: 6
+  user_sync_burst_rest_count: 80
+  user_sync_burst_rest_seconds_min: 60
+  user_sync_burst_rest_seconds_max: 90
   history_chunk_timeout_seconds: 240     # 单个历史分段子进程最长运行秒数
   history_inline_comments: false        # 历史模式先补帖子，评论后置修复
   history_reuse_single_client: true     # 同一批历史任务复用单一已验证会话
-  history_browser_recycle_pages: 8      # 历史长跑时每 N 页轻量回收会话页
-  history_browser_recycle_requests: 28  # 历史长跑时每 N 次请求轻量回收会话页
+  history_browser_recycle_pages: 30      # 历史长跑时每 N 页轻量回收会话页
+  history_browser_recycle_requests: 100  # 历史长跑时每 N 次请求轻量回收会话页
   history_comment_repair_batch_posts: 4       # 历史阶段每轮评论修复处理多少帖子
   history_comment_repair_timeout_seconds: 240 # 单轮评论修复最长秒数
   history_comment_repair_max_rounds: 2        # 每只股票最多修复多少轮评论

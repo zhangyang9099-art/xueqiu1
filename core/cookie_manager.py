@@ -41,7 +41,10 @@ class CookieManager:
         self._config_path = config_path
         cookie_cfg = config.get("cookie", {}) or {}
         self._cookie_file = cookie_cfg.get("cookie_file", self.DEFAULT_COOKIE_FILE)
-        self._xq_a_token = cookie_cfg.get("xq_a_token", "")
+        self._xq_a_token = (
+            os.environ.get("XUEQIU_TOKEN", "").strip()
+            or cookie_cfg.get("xq_a_token", "")
+        )
         self._browser_cookies = []
         self.notifier = Notifier(config)
 
@@ -49,7 +52,7 @@ class CookieManager:
         self._ensure_token_cookie()
 
         if not self.is_configured():
-            logger.warning("xq_a_token 未配置！请先在 config.yaml 中填入有效的 Cookie。")
+            logger.warning("xq_a_token 未配置！请通过环境变量 XUEQIU_TOKEN 或 Cookie 文件提供有效登录态。")
 
     # ──────── 基础读取 ────────
 

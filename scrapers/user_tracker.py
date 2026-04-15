@@ -48,17 +48,31 @@ class UserTracker:
         self.history_confirm_runs = config.get("history_confirm_runs", 2)
         self.history_chunk_pages = max(1, int(config.get("user_history_chunk_pages", 3) or 3))
         self.timeline_page_size = int(config.get("user_timeline_page_size", 20) or 20)
+        raw_probe_counts = config.get("user_timeline_probe_counts", [40, 30, 20]) or [40, 30, 20]
+        self.timeline_probe_counts = []
+        for raw in raw_probe_counts:
+            try:
+                val = int(raw or 0)
+            except Exception:
+                continue
+            if val > 0 and val not in self.timeline_probe_counts:
+                self.timeline_probe_counts.append(val)
         self.timeline_request_timeout_ms = int(config.get("timeline_request_timeout_ms", 30000) or 30000)
         self.timeline_request_retries = max(1, int(config.get("timeline_request_retries", 2) or 2))
         # 评论抓取配置（复用股票模式的参数）
         self.comment_v3_enabled = bool(config.get("comment_v3_enabled", True))
         self.comment_v3_page_size = max(1, int(config.get("comment_v3_page_size", 20) or 20))
+        self.comment_variant_page_size = max(1, int(config.get("comment_variant_page_size", 100) or 100))
         self.comment_v3_child_max_pages = max(1, int(config.get("comment_v3_child_max_pages", 15) or 15))
         self.comment_post_budget_seconds = float(config.get("user_comment_post_budget_seconds", 30) or 30)
+        self.comment_post_primary_budget_seconds = min(25.0, self.comment_post_budget_seconds)
         self.max_comments_per_post = int(config.get("user_comment_max_pages", 20) or 20)
         self.fetch_comments_enabled = bool(config.get("user_fetch_comments_enabled", True))
         self.user_incremental_comment_gap_limit = max(
             0, int(config.get("user_incremental_comment_gap_limit", 60) or 60)
+        )
+        self.user_comment_backfill_threshold = max(
+            0, int(config.get("user_comment_backfill_threshold", 2) or 2)
         )
         self.history_cursor_enabled = bool(config.get("history_cursor_enabled", True))
         # Transport 配置（参照评论回填模式）
@@ -80,11 +94,13 @@ class UserTracker:
         page: int,
         mode: str = "update",
         transport_override: str | None = None,
+        page_size: int | None = None,
     ):
         transport = transport_override or self._timeline_transport_for_mode(mode)
+        effective_page_size = max(1, int(page_size or self.timeline_page_size))
         data = self.client.get(
             build_user_timeline_url(),
-            params=build_user_timeline_params(user_id, page=page),
+            params=build_user_timeline_params(user_id, count=effective_page_size, page=page),
             referer_path=f"/u/{user_id}",
             timeout_ms=self.timeline_request_timeout_ms,
             max_retries=self.timeline_request_retries,
@@ -110,6 +126,7 @@ class UserTracker:
         seen_comment_ids = set()
         started_at = time.time()
         deadline = started_at + self.comment_post_budget_seconds
+        primary_deadline = started_at + self.comment_post_primary_budget_seconds
         v3_meta = {"status_reply_count": 0, "has_filtered": False}
         v3_success = False
 
@@ -121,7 +138,7 @@ class UserTracker:
             if self.comment_v3_enabled:
                 try:
                     added, v3_meta = self._collect_comment_thread_v3(
-                        post_id, seen_comment_ids, display_name, deadline=deadline,
+                        post_id, seen_comment_ids, display_name, deadline=primary_deadline,
                     )
                     new_count += added
                     v3_success = True
@@ -132,7 +149,11 @@ class UserTracker:
 
             if not v3_success:
                 new_count += self._collect_comment_variant(
-                    post_id, seen_comment_ids, display_name, deadline=deadline,
+                    post_id,
+                    seen_comment_ids,
+                    display_name,
+                    deadline=deadline,
+                    count=self.comment_variant_page_size,
                 )
 
             self.db.update_post_comments_scraped(post_id, commit=False)
@@ -242,7 +263,60 @@ class UserTracker:
             page += 1
         return added
 
-    def _fetch_and_save_parent_post(self, status_id: str, display_name: str = "") -> int:
+    def _fetch_post_comments_with_retry(
+        self,
+        post_id: str,
+        display_name: str,
+        *,
+        symbol: str = "",
+        deferred_posts: set[str] | None = None,
+        failure_streaks: dict[str, int] | None = None,
+    ) -> tuple[int, str]:
+        """
+        用户模式评论抓取包装层。
+
+        Returns:
+            (新增评论数, result)
+            result ∈ {"success", "deferred", "skipped"}
+        """
+        deferred_posts = deferred_posts if deferred_posts is not None else set()
+        failure_streaks = failure_streaks if failure_streaks is not None else {}
+        if post_id in deferred_posts:
+            return 0, "skipped"
+
+        for attempt in range(1, 3):
+            try:
+                return self._fetch_post_comments(post_id, display_name, symbol=symbol), "success"
+            except Exception as e:
+                failure_streaks[post_id] = failure_streaks.get(post_id, 0) + 1
+                logger.warning(
+                    f"[{display_name}] 帖子 {post_id} 评论抓取失败，第 {attempt} 次: {e}"
+                )
+                if hasattr(self.client, "get_last_failure_meta"):
+                    meta = self.client.get_last_failure_meta()
+                    category = str(meta.get("category", "") or "")
+                    if category:
+                        logger.warning(
+                            f"[{display_name}] 帖子 {post_id} 评论失败分类: {category}"
+                        )
+                try:
+                    self.client.rate_limiter.on_failure()
+                except Exception:
+                    pass
+                if attempt == 1:
+                    time.sleep(1.0)
+                    continue
+        deferred_posts.add(post_id)
+        return 0, "deferred"
+
+    def _fetch_and_save_parent_post(
+        self,
+        status_id: str,
+        display_name: str = "",
+        *,
+        deferred_posts: set[str] | None = None,
+        failure_streaks: dict[str, int] | None = None,
+    ) -> int:
         """
         获取单条帖子详情并存入 posts 表，然后抓取其评论。
 
@@ -279,7 +353,14 @@ class UserTracker:
         scraped = progress.get("comments_scraped", 0)
         claimed = post.get("reply_count", 0)
         if claimed > 0 and scraped < claimed:
-            return self._fetch_post_comments(status_id, display_name, symbol=symbol)
+            added, _ = self._fetch_post_comments_with_retry(
+                status_id,
+                display_name,
+                symbol=symbol,
+                deferred_posts=deferred_posts,
+                failure_streaks=failure_streaks,
+            )
+            return added
         return 0
 
     def _refresh_user_comment_gaps(self, user_id: str, display_name: str = "") -> int:
@@ -298,10 +379,24 @@ class UserTracker:
         if not gap_posts:
             return 0
 
+        prioritized = []
+        deferred_tail = []
+        for post in gap_posts:
+            claimed = int(post.get("reply_count", 0) or 0)
+            scraped = int(post.get("comments_scraped", 0) or 0)
+            gap = max(0, claimed - scraped)
+            if gap <= self.user_comment_backfill_threshold:
+                deferred_tail.append(post)
+            else:
+                prioritized.append(post)
+        gap_posts = prioritized + deferred_tail
+
         logger.info(
             f"[{display_name}] 增量后置评论修复开始: {len(gap_posts)} 个旧发言仍有评论缺口"
         )
         added_total = 0
+        deferred_posts: set[str] = set()
+        failure_streaks: dict[str, int] = {}
         for idx, post in enumerate(gap_posts, start=1):
             post_id = str(post.get("id", ""))
             claimed = int(post.get("reply_count", 0) or 0)
@@ -310,11 +405,18 @@ class UserTracker:
             if not post_id or gap <= 0:
                 continue
             try:
-                added = self._fetch_post_comments(
+                added, result = self._fetch_post_comments_with_retry(
                     post_id,
                     f"{display_name} 旧发言评论修复[{idx}/{len(gap_posts)}]",
                     symbol=str(post.get("symbol", "") or ""),
+                    deferred_posts=deferred_posts,
+                    failure_streaks=failure_streaks,
                 )
+                if result == "deferred":
+                    logger.warning(
+                        f"[{display_name}] 旧发言评论修复 deferred {idx}/{len(gap_posts)} | 帖子 {post_id}"
+                    )
+                    continue
                 added_total += added
                 progress = self.db.get_post_comment_progress(post_id) or {}
                 logger.info(
@@ -327,9 +429,9 @@ class UserTracker:
                 )
         return added_total
 
-    def _locate_history_start_page(self, user_id: str, boundary_time: int) -> tuple:
+    def _locate_history_start_page(self, user_id: str, boundary_time: int, *, page_size: int | None = None) -> tuple:
         """二分定位历史模式起始页。返回 (start_page, page_cache, max_page)。"""
-        first = self._fetch_timeline_page(user_id, 1, mode="backfill")
+        first = self._fetch_timeline_page(user_id, 1, mode="backfill", page_size=page_size)
         max_page = int(first.get("max_page") or 0)
         if boundary_time <= 0 or max_page <= 1:
             return 1, {1: first}, max_page
@@ -340,7 +442,7 @@ class UserTracker:
 
         def get_page(mid: int):
             if mid not in page_cache:
-                page_cache[mid] = self._fetch_timeline_page(user_id, mid, mode="backfill")
+                page_cache[mid] = self._fetch_timeline_page(user_id, mid, mode="backfill", page_size=page_size)
             return page_cache[mid]
 
         low, high = 1, max_page
@@ -367,14 +469,14 @@ class UserTracker:
             return max_page + 1, page_cache, max_page
         return candidate, page_cache, max_page
 
-    def _resolve_history_start_page(self, user_id: str, boundary_time: int, display_name: str) -> tuple:
+    def _resolve_history_start_page(self, user_id: str, boundary_time: int, display_name: str, *, page_size: int | None = None) -> tuple:
         """优先从 cursor 恢复，回退到二分定位。"""
         if self.history_cursor_enabled:
             cursor = self.db.get_user_history_cursor(user_id)
             cursor_page = int(cursor.get("page") or 0)
             if cursor_page > 1:
                 try:
-                    info = self._fetch_timeline_page(user_id, cursor_page, mode="backfill")
+                    info = self._fetch_timeline_page(user_id, cursor_page, mode="backfill", page_size=page_size)
                     max_page = int(info.get("max_page") or 0)
                     if info.get("statuses") and (max_page <= 0 or cursor_page <= max_page):
                         if info.get("oldest", 0) >= boundary_time and boundary_time > 0:
@@ -388,7 +490,7 @@ class UserTracker:
                     logger.info(f"[{display_name}] 历史游标 page={cursor_page} 无效，重新定位边界页")
                 except Exception as e:
                     logger.warning(f"[{display_name}] 读取历史游标失败，改为重新定位: {e}")
-        return self._locate_history_start_page(user_id, boundary_time)
+        return self._locate_history_start_page(user_id, boundary_time, page_size=page_size)
 
     def track_user(self, user_id: str, screen_name: str = "", mode: str = "update") -> dict:
         """
@@ -426,6 +528,8 @@ class UserTracker:
         status = "success"
         error_msg = ""
         error_category = ""
+        deferred_comment_posts: set[str] = set()
+        comment_failure_streaks: dict[str, int] = {}
         latest_status_time = last_check_time or 0
         oldest_crawled_status_time = oldest_status_time or 0
         progress_made = False
@@ -438,7 +542,7 @@ class UserTracker:
         self.db.update_user_runtime_progress(
             user_id,
             mode=mode,
-            state="running",
+            state="auth_probe",
             page=0,
             chunk=0,
             total_pages=self.max_pages,
@@ -446,6 +550,26 @@ class UserTracker:
         )
 
         try:
+            ready = self.client.ensure_user_timeline_ready(
+                user_id,
+                screen_name=screen_name,
+                probe_count=self.timeline_page_size,
+                probe_candidates=self.timeline_probe_counts,
+            )
+            effective_timeline_page_size = int(ready.get("resolved_count") or self.timeline_page_size)
+            logger.info(
+                f"[{display_name}] 用户时间线页大小已锁定: {effective_timeline_page_size} "
+                f"(配置 {self.timeline_page_size}, 候选 {self.timeline_probe_counts})"
+            )
+            self.db.update_user_runtime_progress(
+                user_id,
+                mode=mode,
+                state="running",
+                page=0,
+                chunk=0,
+                total_pages=self.max_pages,
+                started_at=runtime_started_at,
+            )
             page = 1
             pages_processed = 0
             should_stop = False
@@ -460,6 +584,7 @@ class UserTracker:
                     user_id,
                     oldest_status_time,
                     display_name,
+                    page_size=effective_timeline_page_size,
                 )
                 if page_cache:
                     logger.info(
@@ -481,7 +606,10 @@ class UserTracker:
                     total_pages=max_page or located_max_page or self.max_pages,
                     started_at=runtime_started_at,
                 )
-                logger.info(f"[{display_name}] 获取发言列表 第 {page}/{located_max_page or '?'} 页...")
+                logger.info(
+                    f"[{display_name}] 获取发言列表 第 {page}/{located_max_page or '?'} 页..."
+                    f" (count={effective_timeline_page_size})"
+                )
                 page_new_statuses = 0
                 page_new_comments = 0
                 page_t0 = time.time()
@@ -489,7 +617,12 @@ class UserTracker:
                 if page in page_cache:
                     page_info = page_cache.pop(page)
                 else:
-                    page_info = self._fetch_timeline_page(user_id, page, mode=mode)
+                    page_info = self._fetch_timeline_page(
+                        user_id,
+                        page,
+                        mode=mode,
+                        page_size=effective_timeline_page_size,
+                    )
 
                 statuses = page_info["statuses"]
                 max_page = page_info["max_page"]
@@ -544,12 +677,16 @@ class UserTracker:
                             scraped = progress.get("comments_scraped", 0)
                             claimed = status_data["reply_count"]
                             if scraped < claimed:
-                                try:
-                                    nc = self._fetch_post_comments(post_id, display_name)
-                                    total_new_comments += nc
-                                    page_new_comments += nc
-                                except Exception as e:
-                                    logger.warning(f"[{display_name}] 帖子 {post_id} 评论抓取失败: {e}")
+                                nc, result = self._fetch_post_comments_with_retry(
+                                    post_id,
+                                    display_name,
+                                    deferred_posts=deferred_comment_posts,
+                                    failure_streaks=comment_failure_streaks,
+                                )
+                                total_new_comments += nc
+                                page_new_comments += nc
+                                if result == "deferred":
+                                    logger.warning(f"[{display_name}] 帖子 {post_id} 评论抓取 deferred，先继续翻页")
                         else:
                             # Type c: 用户评论/转发了别人的帖子 → 抓父帖子完整内容+评论
                             parent_id = status_data.get("parent_status_id") or status_data.get("retweet_status_id", "")
@@ -558,7 +695,12 @@ class UserTracker:
                                 existing = self.db.get_post(parent_id)
                                 if not existing:
                                     try:
-                                        nc = self._fetch_and_save_parent_post(parent_id, display_name)
+                                        nc = self._fetch_and_save_parent_post(
+                                            parent_id,
+                                            display_name,
+                                            deferred_posts=deferred_comment_posts,
+                                            failure_streaks=comment_failure_streaks,
+                                        )
                                         total_new_comments += nc
                                         page_new_comments += nc
                                     except Exception as e:
@@ -569,19 +711,28 @@ class UserTracker:
                                     scraped = progress.get("comments_scraped", 0)
                                     claimed = int(existing.get("reply_count", 0) or 0)
                                     if scraped < claimed:
-                                        try:
-                                            nc = self._fetch_post_comments(parent_id, display_name)
-                                            total_new_comments += nc
-                                            page_new_comments += nc
-                                        except Exception as e:
-                                            logger.warning(f"[{display_name}] 父帖子 {parent_id} 评论补全失败: {e}")
+                                        nc, result = self._fetch_post_comments_with_retry(
+                                            parent_id,
+                                            display_name,
+                                            deferred_posts=deferred_comment_posts,
+                                            failure_streaks=comment_failure_streaks,
+                                        )
+                                        total_new_comments += nc
+                                        page_new_comments += nc
+                                        if result == "deferred":
+                                            logger.warning(f"[{display_name}] 父帖子 {parent_id} 评论补全 deferred，先继续翻页")
                                 # Type c: 也把用户这条评论存为帖子本身（如果它是转发帖包含正文）
                                 retweet_id = status_data.get("retweet_status_id", "")
                                 if retweet_id and retweet_id != parent_id:
                                     existing_rt = self.db.get_post(retweet_id)
                                     if not existing_rt:
                                         try:
-                                            nc = self._fetch_and_save_parent_post(retweet_id, display_name)
+                                            nc = self._fetch_and_save_parent_post(
+                                                retweet_id,
+                                                display_name,
+                                                deferred_posts=deferred_comment_posts,
+                                                failure_streaks=comment_failure_streaks,
+                                            )
                                             total_new_comments += nc
                                             page_new_comments += nc
                                         except Exception as e:
@@ -595,11 +746,16 @@ class UserTracker:
                 eta_sec = remaining_pages / max(pages_per_sec, 0.001) if remaining_pages > 0 else 0
                 eta_str = f"预计剩余 {eta_sec:.0f}s" if eta_sec > 0 else ""
                 mode_tag = "补全" if mode == "backfill" else "增量"
+                oldest_str = datetime.fromtimestamp(oldest_crawled_status_time / 1000).strftime("%Y-%m-%d %H:%M") if oldest_crawled_status_time else "-"
+                latest_str = datetime.fromtimestamp(latest_status_time / 1000).strftime("%Y-%m-%d %H:%M") if latest_status_time else "-"
+                cursor_str = str(page + 1) if mode == "backfill" else "-"
+                deferred_count = len(deferred_comment_posts)
                 print(
                     f"  [{mode_tag}] page {page}/{max_page or '?'} | chunk {runtime_chunk} | "
                     f"本页 +{page_new_statuses}发言 +{page_new_comments}评论 | "
                     f"累计 {total_new}发言 {total_new_comments}评论 | "
-                    f"耗时 {page_elapsed:.1f}s{eta_str}",
+                    f"最早 {oldest_str} | 最新 {latest_str} | cursor {cursor_str} | "
+                    f"deferred评帖 {deferred_count} | 耗时 {page_elapsed:.1f}s {eta_str}".rstrip(),
                     flush=True,
                 )
 
@@ -703,10 +859,12 @@ class UserTracker:
             "error": error_msg,
             "error_category": error_category,
             "last_page": int(last_page_attempted or 0),
+            "deferred_comment_posts": len(deferred_comment_posts),
         }
 
         logger.info(
-            f"[{display_name}] {mode_label}完成: 新发言 {total_new} 条, 新评论 {total_new_comments} 条, 状态 {status} | "
+            f"[{display_name}] {mode_label}完成: 新发言 {total_new} 条, 新评论 {total_new_comments} 条, "
+            f"deferred评论帖 {len(deferred_comment_posts)} 个, 状态 {status} | "
             f"总耗时 {(time.time() - track_start_time):.1f}s, 处理 {pages_processed} 页"
         )
 

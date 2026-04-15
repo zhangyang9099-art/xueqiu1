@@ -223,6 +223,7 @@ def build_user_timeline_url() -> str:
 
 def build_user_timeline_params(
     user_id: str,
+    count: int = 40,
     page: int = 1,
 ) -> dict:
     """
@@ -234,6 +235,7 @@ def build_user_timeline_params(
     """
     return {
         "user_id": str(user_id),
+        "count": int(count),
         "page": page,
         "type": "all",
         "_": int(time.time() * 1000),
