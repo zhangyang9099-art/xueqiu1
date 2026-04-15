@@ -8,7 +8,7 @@
 #   2. F12 → Application → Cookies → xueqiu.com
 #   3. 复制 xq_a_token 的 Value 粘贴到下方
 cookie:
-  xq_a_token: "cb0038461faa714a89b1243eb0972aeb978da553"
+  xq_a_token: ""
   cookie_file: "data/browser_cookies.json"
 
 # --- 监控股票列表 ---
