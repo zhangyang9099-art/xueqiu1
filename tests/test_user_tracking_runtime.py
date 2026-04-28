@@ -2,12 +2,24 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from storage.database import Database
+from scrapers.user_tracker import UserTracker
 from utils.query_progress import parse_user_history_log
 
 
 class UserTrackingRuntimeTests(unittest.TestCase):
+    def test_update_mode_does_not_stop_when_page_contains_new_and_old_mixed(self):
+        tracker = UserTracker(
+            client=SimpleNamespace(),
+            db=SimpleNamespace(),
+            config={},
+        )
+        self.assertFalse(tracker._should_stop_update_after_page(5, True))
+        self.assertTrue(tracker._should_stop_update_after_page(0, True))
+        self.assertFalse(tracker._should_stop_update_after_page(0, False))
+
     def test_user_history_cursor_and_last_sync_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "xueqiu.db")

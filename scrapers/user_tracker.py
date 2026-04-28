@@ -68,6 +68,287 @@ class UserTracker:
             "user_history_timeline_fallback_transport", "isolated_page"
         )
 
+    def _resolve_comment_backfill_target(self, status_data: dict) -> tuple[str, str]:
+        """根据用户发言解析评论回填的目标帖子。"""
+        if not status_data:
+            return "", ""
+        if bool(status_data.get("is_original_post", True)):
+            return str(status_data.get("id") or "").strip(), "original"
+        parent_id = str(status_data.get("parent_status_id") or "").strip()
+        if parent_id:
+            return parent_id, "parent"
+        retweet_id = str(status_data.get("retweet_status_id") or "").strip()
+        if retweet_id:
+            return retweet_id, "retweet"
+        return "", ""
+
+    @staticmethod
+    def _should_stop_update_after_page(page_new_statuses: int, page_hit_synced_boundary: bool) -> bool:
+        """
+        更新模式下，只有整页都没有新增发言，且页内已经命中数据库同步边界时，才停止翻页。
+        这样可以避免第一页混入置顶/乱序旧帖时过早退出。
+        """
+        return page_new_statuses == 0 and page_hit_synced_boundary
+
+    def _backfill_target_post_once(self, target_post_id: str, display_name: str = "") -> tuple[int, int]:
+        """确保目标帖子存在，并补齐其评论。返回 (new_posts, new_comments)。"""
+        existed = self.db.get_post(target_post_id) is not None
+        new_comments = self._fetch_and_save_parent_post(target_post_id, display_name)
+        exists_now = self.db.get_post(target_post_id) is not None
+        new_posts = 1 if (not existed and exists_now) else 0
+        return new_posts, new_comments
+
+    def _backfill_target_post_with_retry(self, target_post_id: str, display_name: str = "") -> dict:
+        """
+        单帖评论回填：失败一次轻恢复重试；第二次失败则 deferred。
+        """
+        last_error = ""
+        last_category = ""
+        for attempt in range(1, 3):
+            try:
+                new_posts, new_comments = self._backfill_target_post_once(
+                    target_post_id,
+                    f"{display_name} 帖子回填[{attempt}/2]",
+                )
+                return {
+                    "status": "success",
+                    "new_posts": new_posts,
+                    "new_comments": new_comments,
+                    "error": "",
+                    "error_category": "",
+                }
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                failure_meta = self.client.get_last_failure_meta() or {}
+                last_category = str(failure_meta.get("category") or "")
+                logger.warning(
+                    f"[{display_name}] 目标帖子 {target_post_id} 回填失败 {attempt}/2: "
+                    f"{last_error} category={last_category}"
+                )
+                if attempt == 1:
+                    try:
+                        self.client.rate_limiter.on_failure()
+                    except Exception:
+                        pass
+                    continue
+        return {
+            "status": "deferred",
+            "new_posts": 0,
+            "new_comments": 0,
+            "error": last_error,
+            "error_category": last_category,
+        }
+
+    def backfill_user_comment_threads(
+        self,
+        user_id: str,
+        screen_name: str = "",
+        *,
+        max_statuses: int | None = None,
+        max_posts: int | None = None,
+        days: int | None = None,
+        resume: bool = True,
+    ) -> dict:
+        """
+        从 user_statuses 推导目标帖子，独立执行帖子本体与评论回填。
+        """
+        display_name = f"用户 {user_id}" + (f"({screen_name})" if screen_name else "")
+        started_at_iso = datetime.now().isoformat()
+        started_at_ms = int(time.time() * 1000)
+        logger.info(f"---------- 开始用户评论独立回填 {display_name} ----------")
+
+        state = self.db.get_user_comment_backfill_state(user_id)
+        deferred_ids = [str(pid).strip() for pid in (state.get("deferred_post_ids") or []) if str(pid).strip()]
+        after_created_at = int(state.get("last_status_created_at") or 0) if resume else 0
+        after_status_id = str(state.get("last_status_id") or "") if resume else ""
+
+        processed_statuses = int(state.get("processed_statuses") or 0)
+        discovered_posts = int(state.get("discovered_posts") or 0)
+        processed_posts = int(state.get("processed_posts") or 0)
+        new_posts_total = int(state.get("new_posts") or 0)
+        new_comments_total = int(state.get("new_comments") or 0)
+        last_error_category = str(state.get("last_error_category") or "")
+        seen_targets: set[str] = set(deferred_ids)
+        run_processed_statuses = 0
+        run_discovered_posts = 0
+        run_processed_posts = 0
+        run_new_posts = 0
+        run_new_comments = 0
+        final_status = "success"
+        posts_budget = max(1, int(max_posts)) if max_posts else None
+        statuses_budget = max(1, int(max_statuses)) if max_statuses else None
+
+        self.db.update_user_comment_backfill_runtime(
+            user_id,
+            state="running",
+            status_id=after_status_id,
+            post_id=deferred_ids[0] if deferred_ids else "",
+            started_at=started_at_ms,
+        )
+
+        def persist_state(*, status_id="", status_created_at=0, post_id="", runtime_state="running"):
+            self.db.upsert_user_comment_backfill_state(
+                user_id,
+                last_status_id=status_id or after_status_id,
+                last_status_created_at=status_created_at or after_created_at,
+                last_target_post_id=post_id or state.get("last_target_post_id", ""),
+                processed_statuses=processed_statuses + run_processed_statuses,
+                discovered_posts=discovered_posts + run_discovered_posts,
+                processed_posts=processed_posts + run_processed_posts,
+                new_posts=new_posts_total + run_new_posts,
+                new_comments=new_comments_total + run_new_comments,
+                deferred_posts=len(deferred_ids),
+                deferred_post_ids=deferred_ids,
+                last_error_category=last_error_category,
+                runtime_state=runtime_state,
+                runtime_status_id=status_id or "",
+                runtime_post_id=post_id or "",
+                runtime_started_at=started_at_ms,
+                runtime_updated_at=int(time.time() * 1000),
+            )
+
+        try:
+            # 优先处理上轮 deferred 的帖子
+            while deferred_ids and (posts_budget is None or run_processed_posts < posts_budget):
+                target_post_id = deferred_ids[0]
+                self.db.update_user_comment_backfill_runtime(
+                    user_id,
+                    state="running",
+                    status_id=after_status_id,
+                    post_id=target_post_id,
+                    started_at=started_at_ms,
+                )
+                result = self._backfill_target_post_with_retry(target_post_id, display_name)
+                if result["status"] == "success":
+                    deferred_ids.pop(0)
+                    run_processed_posts += 1
+                    run_new_posts += int(result.get("new_posts") or 0)
+                    run_new_comments += int(result.get("new_comments") or 0)
+                    last_error_category = ""
+                else:
+                    last_error_category = str(result.get("error_category") or "")
+                    # 避免同一个 deferred 帖子本轮反复空转
+                    break
+                persist_state(post_id=target_post_id)
+
+            statuses = self.db.iter_user_statuses_for_comment_backfill(
+                user_id,
+                after_created_at=after_created_at,
+                after_status_id=after_status_id,
+                days=days,
+                limit=statuses_budget,
+            )
+
+            for status_data in statuses:
+                if posts_budget is not None and run_processed_posts >= posts_budget:
+                    break
+
+                status_id = str(status_data.get("id") or "").strip()
+                status_created_at = int(status_data.get("created_at") or 0)
+                run_processed_statuses += 1
+                self.db.update_user_comment_backfill_runtime(
+                    user_id,
+                    state="running",
+                    status_id=status_id,
+                    post_id="",
+                    started_at=started_at_ms,
+                )
+
+                target_post_id, target_kind = self._resolve_comment_backfill_target(status_data)
+                after_status_id = status_id
+                after_created_at = status_created_at
+                if not target_post_id:
+                    persist_state(status_id=status_id, status_created_at=status_created_at)
+                    continue
+                if target_post_id in seen_targets:
+                    persist_state(status_id=status_id, status_created_at=status_created_at)
+                    continue
+
+                seen_targets.add(target_post_id)
+                run_discovered_posts += 1
+                self.db.update_user_comment_backfill_runtime(
+                    user_id,
+                    state="running",
+                    status_id=status_id,
+                    post_id=target_post_id,
+                    started_at=started_at_ms,
+                )
+                result = self._backfill_target_post_with_retry(
+                    target_post_id,
+                    f"{display_name} {target_kind}",
+                )
+                if result["status"] == "success":
+                    run_processed_posts += 1
+                    run_new_posts += int(result.get("new_posts") or 0)
+                    run_new_comments += int(result.get("new_comments") or 0)
+                    last_error_category = ""
+                else:
+                    if target_post_id not in deferred_ids:
+                        deferred_ids.append(target_post_id)
+                    last_error_category = str(result.get("error_category") or "")
+                persist_state(
+                    status_id=status_id,
+                    status_created_at=status_created_at,
+                    post_id=target_post_id,
+                )
+                elapsed = max(1.0, time.time() - (started_at_ms / 1000))
+                eta_str = ""
+                if run_processed_posts > 0:
+                    per_post = elapsed / run_processed_posts
+                    eta = per_post * max(0, len(deferred_ids))
+                    if eta > 0:
+                        eta_str = f" | ETA {eta:.0f}s"
+                print(
+                    f"  [用户评论回填] {display_name} | status {run_processed_statuses}"
+                    f" | 目标帖 {run_discovered_posts}"
+                    f" | 已补 {run_processed_posts}"
+                    f" | 新帖 {run_new_posts}"
+                    f" | 新评论 {run_new_comments}"
+                    f" | deferred {len(deferred_ids)}{eta_str}",
+                    flush=True,
+                )
+
+            persist_state(
+                status_id=after_status_id,
+                status_created_at=after_created_at,
+                post_id=state.get("last_target_post_id", ""),
+                runtime_state="deferred" if deferred_ids else "completed",
+            )
+            final_status = "partial" if deferred_ids else "success"
+            return {
+                "user_id": user_id,
+                "screen_name": screen_name,
+                "status": final_status,
+                "processed_statuses": run_processed_statuses,
+                "discovered_posts": run_discovered_posts,
+                "processed_posts": run_processed_posts,
+                "new_posts": run_new_posts,
+                "new_comments": run_new_comments,
+                "deferred_posts": len(deferred_ids),
+                "last_error_category": last_error_category,
+            }
+        except Exception as e:
+            last_error_category = str(self.client.get_last_failure_meta().get("category", "") or "")
+            final_status = "failed"
+            persist_state(
+                status_id=after_status_id,
+                status_created_at=after_created_at,
+                post_id=state.get("last_target_post_id", ""),
+                runtime_state="failed",
+            )
+            raise
+        finally:
+            self.db.log_scrape(
+                task_type="user_comment_backfill",
+                target=user_id,
+                status=final_status,
+                new_items_count=run_new_comments,
+                error_message=last_error_category,
+                started_at=started_at_iso,
+                duration_seconds=time.time() - (started_at_ms / 1000),
+            )
+            self.db.clear_user_comment_backfill_runtime(user_id)
+
     def _timeline_transport_for_mode(self, mode: str) -> str:
         """根据模式选择 transport 类型（参照 stock_comments 模式）。"""
         if mode == "backfill":
@@ -485,6 +766,8 @@ class UserTracker:
                 page_new_statuses = 0
                 page_new_comments = 0
                 page_t0 = time.time()
+                page_hit_synced_boundary = False
+                page_boundary_status_id = ""
 
                 if page in page_cache:
                     page_info = page_cache.pop(page)
@@ -503,18 +786,17 @@ class UserTracker:
                     status_data = extract_user_status_fields(raw_status)
 
                     if mode == "update":
+                        status_exists = self.db.user_status_exists(status_data["id"])
                         if last_check_time and (
                             (status_data["created_at"] < last_check_time)
                             or (
                                 status_data["created_at"] <= last_check_time
-                                and self.db.user_status_exists(status_data["id"])
+                                and status_exists
                             )
                         ):
-                            logger.info(
-                                f"[{display_name}] 命中数据库最新重复发言 (id={status_data['id']}), 停止翻页"
-                            )
-                            should_stop = True
-                            break
+                            page_hit_synced_boundary = True
+                            page_boundary_status_id = status_data["id"]
+                            continue
                     else:
                         if oldest_status_time and status_data["created_at"] >= oldest_status_time:
                             continue
@@ -602,6 +884,18 @@ class UserTracker:
                     f"耗时 {page_elapsed:.1f}s{eta_str}",
                     flush=True,
                 )
+
+                if mode == "update" and self._should_stop_update_after_page(
+                    page_new_statuses,
+                    page_hit_synced_boundary,
+                ):
+                    if page_boundary_status_id:
+                        logger.info(
+                            f"[{display_name}] 当前页未发现新增发言，且命中数据库最新重复发言 "
+                            f"(id={page_boundary_status_id}), 停止翻页"
+                        )
+                    should_stop = True
+                    break
 
                 if page >= max_page:
                     history_complete = mode == "backfill"
